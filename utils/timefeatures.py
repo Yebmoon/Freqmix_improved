@@ -1,4 +1,3 @@
-# From: gluonts/src/gluonts/time_feature/_base.py
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
