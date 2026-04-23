@@ -202,7 +202,6 @@ def wdba(x, labels, batch_size=6, slope_constraint="symmetric", use_window=True,
             ret[i,:] = x[i]
     return ret
 
-# Proposed
 
 def random_guided_warp(x, labels, slope_constraint="symmetric", use_window=True, dtw_type="normal", verbose=0):
     # use verbose = -1 to turn off warnings

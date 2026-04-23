@@ -17,6 +17,10 @@ from models.TMWF import TMWF_DFNet
 from models.BAPM import BAPM
 from models.CNN import CNN1d
 from models.DF import DeepFinger
+import yaml
+from Rosseta.resnet_base_network import ResNet18
+import torch.nn.functional as F
+import os
 
 flow_column_types = {
     'start_time': str,
@@ -32,11 +36,12 @@ flow_column_types = {
     'label':'Int32'
 }
 
-DROP_DUPLICATE = True
 EARLY_STOP_EPOCH = 20
 USE_TRANSFORMER = False
-FREQMIX = False
+MIX = False
 PRE_AUG = False
+SINGLE_AUG = False
+ROSETTA = False
 
 class LSTMClassifier(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=1):
@@ -52,9 +57,9 @@ class LSTMClassifier(nn.Module):
         out = self.fc(ht[-1])
         return out
 
-def pre_aug(x,lengths,strength = 0.1):
-    # shift
-    # shift -2 ~ +2 pos
+def pre_aug(x,lengths,strength = 0.2):
+    
+    
     batch_size = x.shape[0]
     length = x.shape[1]
     device = x.device
@@ -66,50 +71,65 @@ def pre_aug(x,lengths,strength = 0.1):
     rand_mat = torch.where(mask, rand_mat, -torch.inf)
     k_max = k.max().item()
     _, topk_indices = torch.topk(rand_mat, k_max, dim=1)
+
+    scores = torch.arange(length,device=device,dtype=torch.float).expand(batch_size,-1).clone()
+
     shifts = torch.randint(-2, 3, (batch_size, k_max), device=device)
     original_pos = topk_indices
-    new_pos = torch.clamp(original_pos + shifts, 0, length-1)
 
     move_mask = torch.arange(k_max, device=device).unsqueeze(0) < k.unsqueeze(1)
 
     batch_idx = torch.arange(batch_size, device=device)[:, None].expand(-1, k_max)[move_mask]
     orig_flat = original_pos[move_mask]
-    new_flat = new_pos[move_mask]
 
-    new_x = x.clone()
-    new_x[batch_idx, new_flat] = x[batch_idx, orig_flat]
+    shift_flat = shifts[move_mask]
+
+    scores[batch_idx,orig_flat] = (orig_flat.float()+shift_flat)-0.1
+    scores = torch.where(mask, scores, torch.tensor(float('inf'), device=device))
+    sorted_idx = torch.argsort(scores, dim=1)
+    sorted_idx_expanded = sorted_idx.unsqueeze(-1).expand(-1, -1, x.shape[2])
+    new_x = torch.gather(x, 1, sorted_idx_expanded)
+
     return new_x
 
-def pre_aug2(x,lengths,strength = 0.1):
-    # noise
-    # noise -5 ~ +5 
+def pre_aug2(x,lengths,strength = 0.2,noise_scale=0.02):
+    
     batch_size = x.shape[0]
     length = x.shape[1]
     device = x.device
+
     k = (lengths.float() * strength).floor().long()
-    mask = torch.arange(length, device=device).expand(batch_size, -1) < lengths.unsqueeze(1)
+    mask = (torch.arange(length, device=device).expand(batch_size, -1) < lengths.unsqueeze(1)).unsqueeze(-1)
+    valid_x = x*mask.float()
+    flow_mean = valid_x.sum(dim=1)/lengths.unsqueeze(-1).clamp(min=1)
+    sq_diff = ((x-flow_mean.unsqueeze(1))**2)*mask.float()
+    flow_var = sq_diff.sum(dim=1) / lengths.unsqueeze(-1).clamp(min=1)
+    flow_std = torch.sqrt(flow_var) 
 
     rand_mat = torch.rand(batch_size, length, device=device)
-    rand_mat = torch.where(mask, rand_mat, -torch.inf)
+    rand_mat = torch.where(mask.squeeze(-1), rand_mat, -torch.inf)
     k_max = k.max().item()
     _, topk_indices = torch.topk(rand_mat, k_max, dim=1)
 
-    perturbations = torch.randint(-5, 6, (batch_size, k_max), device=device).to(x.dtype)
     valid_mask = torch.arange(k_max, device=device).unsqueeze(0) < k.unsqueeze(1)
 
     batch_idx = torch.arange(batch_size, device=device)[:, None].expand(-1, k_max)[valid_mask]
+
+    selected_std = flow_std[batch_idx]
+    noise = torch.randn(len(batch_idx), x.shape[2], device=device) * selected_std * noise_scale
+
     pos_flat = topk_indices[valid_mask]
-    pert_flat = perturbations[valid_mask]
 
     new_x = x.clone()
-    new_x[batch_idx, pos_flat] += pert_flat
+    new_x[batch_idx, pos_flat] += noise
 
+    new_x = torch.clamp(new_x, min=0.0)
     return new_x
 
 
 
 
-def mixup_data(x, y, lengths, alpha=1.0,window=10):
+def mixup_data(x, y, lengths, alpha=1.0,window=10,mode='ours'):
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
@@ -118,9 +138,16 @@ def mixup_data(x, y, lengths, alpha=1.0,window=10):
     batch_size = x.size()[0]
     length = x.size()[1]
     index = torch.randperm(batch_size)
+    device = x.device
+
+    if mode == 'mixup':
+        mixed_x = lam * x + (1 - lam) * x[index, :].clone().detach()
+        y_a, y_b = y, y[index].clone().detach()
+        return mixed_x, y_a, y_b, lam
+
 
     n_fft = window
-    x_reshape = x.reshape(batch_size,length // n_fft,n_fft)
+    x_reshape = x.reshape(batch_size,length // n_fft,n_fft,x.shape[2])
     fft_result1 = torch.fft.fft(x_reshape)
     fft_result2 = torch.fft.fft(x_reshape[index])
     cutoff_frequency = np.random.beta(alpha,alpha)
@@ -129,41 +156,119 @@ def mixup_data(x, y, lengths, alpha=1.0,window=10):
     cutoff_index = int(cutoff_frequency * (n_fft // 2))
     
     filtered_fft_result = fft_result1.clone()
-    filtered_fft_result[:,:,cutoff_index:n_fft - cutoff_index+1] = 0
+    filtered_fft_result[:,:,cutoff_index:n_fft - cutoff_index+1,:] = 0
     rec_sig_low1 = torch.fft.ifft(filtered_fft_result)
     filtered_fft_result = fft_result1.clone()
-    filtered_fft_result[:,:,:cutoff_index] = 0
-    filtered_fft_result[:,:,n_fft - cutoff_index+1:] = 0
+    filtered_fft_result[:,:,:cutoff_index,:] = 0
+    filtered_fft_result[:,:,n_fft - cutoff_index+1:,:] = 0
     rec_sig_high1 = torch.fft.ifft(filtered_fft_result)
 
     filtered_fft_result = fft_result2.clone()
-    filtered_fft_result[:,:,cutoff_index:n_fft - cutoff_index+1] = 0
+    filtered_fft_result[:,:,cutoff_index:n_fft - cutoff_index+1,:] = 0
     rec_sig_low2 = torch.fft.ifft(filtered_fft_result)
     filtered_fft_result = fft_result2.clone()
-    filtered_fft_result[:,:,:cutoff_index] = 0
-    filtered_fft_result[:,:,n_fft - cutoff_index+1:] = 0
+    filtered_fft_result[:,:,:cutoff_index,:] = 0
+    filtered_fft_result[:,:,n_fft - cutoff_index+1:,:] = 0
     rec_sig_high2 = torch.fft.ifft(filtered_fft_result)
     
     mixed_x = torch.real(rec_sig_low1 + rec_sig_high2)
 
     y_a, y_b = y, y[index].clone().detach()
-    mixed_x = mixed_x.reshape(batch_size,length)
-        
-    indices = torch.nonzero(y_a!=y_b).squeeze()
-    mixed_x[indices] = lam * x[indices] + (1 - lam) * x[index, :][indices]
+    mixed_x = mixed_x.reshape(batch_size,length,x.shape[2])
+
+    if mode!='freq_mix':        
+        indices = torch.nonzero(y_a!=y_b).squeeze()
+        mixed_x[indices] = lam * x[indices] + (1 - lam) * x[index, :][indices]
     
-    mask = torch.arange(length).expand(batch_size,length) < lengths.unsqueeze(1)
+    mask = torch.arange(length,device=device).expand(batch_size,length) < lengths.unsqueeze(1)
     mixed_x[~mask] = 0
 
-    mixed_x = torch.round(mixed_x)
     mixed_x = mixed_x.clone().detach()
-
-    
+     
     return mixed_x, y_a, y_b, lam
 
+def single_augmentation(x, y , mode='noise'):
+    if mode == 'noise':
+        device = x.device
+        batch_size = x.shape[0]
+        percentage = 0.05
+        valid_mask = (x[:,:,0]!=0)
+        lengths = valid_mask.sum(dim=1).to(device)
+        mask = (torch.arange(x.shape[1], device=device).expand(batch_size, -1) < lengths.unsqueeze(1)).unsqueeze(-1)
+        valid_x = x*mask.float()
+        flow_mean = valid_x.sum(dim=1)/lengths.unsqueeze(-1).clamp(min=1)
+        sq_diff = ((x-flow_mean.unsqueeze(1))**2)*mask.float()
+        flow_var = sq_diff.sum(dim=1) / lengths.unsqueeze(-1).clamp(min=1)
+        flow_std = torch.sqrt(flow_var)      
+        noise = torch.rand_like(x, device=device) * (flow_std.unsqueeze(1) * percentage)
+        noisy_sequence = x + noise
+        noisy_sequence = (noisy_sequence * mask).to(dtype=torch.float32)
+        return noisy_sequence
+    elif mode == 'random_mask':
+        device = x.device
+        B,T,F = x.shape
+        valid_mask = (x[:,:,0]!=0)
+        lengths = valid_mask.sum(dim=1).to(device)
+        num_mask = (lengths * 0.2).long()
+        rand = torch.rand(B,T,device=device)
+        rand[~valid_mask] = float('inf')
+        sorted_idx = rand.argsort(dim=1)
+        mask = torch.zeros(B,T,device=device,dtype=torch.bool)
+        row_idx = torch.arange(B,device=device).unsqueeze(1)
+        k_max = num_mask.max()
+        topk_idx = sorted_idx[:,:k_max]
+        valid_k_mask = torch.arange(k_max, device=device).unsqueeze(0) < num_mask.unsqueeze(1)
+        mask[row_idx, topk_idx] = valid_k_mask
+        mask = mask.unsqueeze(-1).expand(-1, -1, F)
+        x_masked = x.clone().detach()
+        x_masked[mask] = 0
+        return x_masked
+    elif mode=='reperm':
+        k = 5
+        batch_size = x.shape[0]
+        seq_len = x.shape[1]
+        device = x.device
+        result = torch.zeros_like(x).to(device)
+        lengths = (x[:,:,0]!=0).sum(dim=1).to(device)
 
+        for i in range(batch_size):
+            actual_length = lengths[i].item()
+            segments = []
+            segment_length = actual_length // k  
+            extra_length = actual_length % k    
+       
+            start_idx = 0
+            for j in range(k):
+                end_idx = start_idx + segment_length + (extra_length if j == k - 1 else 0)  
+                segments.append(x[i, start_idx:end_idx,:])
+                start_idx = end_idx
+       
+            permuted_indices = torch.randperm(k)
+            permuted_segments = [segments[j] for j in permuted_indices]
 
-def train(model:nn.Module, train_loader:DataLoader, val_loader:DataLoader,max_len,lr,savedir,preaug_ratio=0.2,**kwargs):
+            rearranged_tensor = torch.cat(permuted_segments,dim=0)
+            
+            result[i, :len(rearranged_tensor),:] = rearranged_tensor
+            result[i, len(rearranged_tensor):,:] = 0  
+        return result
+
+def generate_encoder():
+    device = 'cuda'
+    config = yaml.load(open("../Rosseta/model/checkpoints/config.yaml", "r"), Loader=yaml.FullLoader)
+    encoder = ResNet18(**config['network'])
+
+    load_params = torch.load(os.path.join('../Rosseta/model/checkpoints/model.pth'),
+                            map_location=torch.device(torch.device(device)))
+
+    if 'online_network_state_dict' in load_params:
+        encoder.load_state_dict(load_params['online_network_state_dict'])
+        print("Parameters successfully loaded.")
+    encoder = torch.nn.Sequential(*list(encoder.children())[:-1])    
+    encoder = encoder.to(device)
+    encoder.eval()
+    return encoder
+
+def train(model:nn.Module, train_loader:DataLoader, val_loader:DataLoader,max_len,lr,savedir,args=None):
     
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -180,24 +285,56 @@ def train(model:nn.Module, train_loader:DataLoader, val_loader:DataLoader,max_le
         format='%(asctime)s - %(levelname)s - %(message)s',
         filemode=filemode
     )
+
+    if ROSETTA:
+        encoder = generate_encoder()
+        proj = nn.Linear(512,max_len).to('cuda')
+        for param in encoder.parameters():
+            param.requires_grad = False
+
     for epoch in range(start_epoch,num_epochs):
         model.train()
         start = time.perf_counter()
         for inputs, targets,length in train_loader:
-            if PRE_AUG:
-                inputs = pre_aug(inputs,length,strength=preaug_ratio)
-                inputs = pre_aug2(inputs,length,strength=preaug_ratio)
 
-            if FREQMIX:
-                inputs, targets_a, targets_b, lam = mixup_data(inputs, targets,length,
-                                                        **kwargs)
+            if ROSETTA:
+                batch_size = inputs.shape[0]
+                seq_len = max_len
+                target_len = 300
+                pad_len = target_len - seq_len
+                if pad_len>0:
+                    inputs = F.pad(inputs,(0,pad_len),'constant',0)
+                inputs = inputs.reshape(-1,3,10,10).to(device)
+                inputs = encoder(inputs).squeeze().unsqueeze(1)
+                
+                inputs = proj(inputs)     
+                
+
+            if PRE_AUG or MIX or SINGLE_AUG:
+                if inputs.dim() == 2:
+                        inputs = inputs.unsqueeze(2)
+            if PRE_AUG:
+                inputs = pre_aug(inputs,length,strength=args.preaug_ratio)
+                inputs = pre_aug2(inputs,length,strength=args.preaug_ratio)
+
+            if MIX:
+                window=args.window
+                if args.aug == 'freq_mix':
+                    window=100
+                inputs, targets_a, targets_b, lam = mixup_data(inputs, targets,length,alpha=args.alpha,window=window,mode=args.aug)
                 targets_a = targets_a.view(-1).to(device)
                 targets_b = targets_b.view(-1).to(device)
+            elif SINGLE_AUG:
+                inputs = single_augmentation(inputs,targets,mode=args.aug)
+            
+            if PRE_AUG or MIX or SINGLE_AUG:
+                inputs = inputs.squeeze()
             
             inputs = inputs.view(-1,max_len)
             targets = targets.view(-1).to(device)
             length = length.view(-1)
             inputs = inputs.unsqueeze(-1).to(device) 
+
             
 
             optimizer.zero_grad()
@@ -208,13 +345,13 @@ def train(model:nn.Module, train_loader:DataLoader, val_loader:DataLoader,max_le
                 padding_masks = torch.arange(max_len).expand(batch_size, max_len) < length.unsqueeze(1)
                 padding_masks = padding_masks.to(device)
                 outputs = model(inputs,padding_masks,None,None)
-                if FREQMIX:
+                if MIX:
                     loss = lam*criterion(outputs,targets_a)+(1-lam)*criterion(outputs,targets_b)
                 else:
                     loss = criterion(outputs, targets)
             else:
                 outputs = model(inputs,length)
-                if FREQMIX:
+                if MIX:
                     loss = lam*criterion(outputs,targets_a)+(1-lam)*criterion(outputs,targets_b)
                 else:
                     loss = criterion(outputs, targets)
@@ -233,10 +370,21 @@ def train(model:nn.Module, train_loader:DataLoader, val_loader:DataLoader,max_le
         val_total = 0
         with torch.no_grad():
             for inputs, targets, length in val_loader:
+                if ROSETTA:
+                    batch_size = inputs.shape[0]
+                    seq_len = max_len
+                    target_len = 300
+                    pad_len = target_len - seq_len
+                    if pad_len>0:
+                        inputs = F.pad(inputs,(0,pad_len),'constant',0)
+                    inputs = inputs.reshape(-1,3,10,10).to(device)
+                    inputs = encoder(inputs).squeeze().unsqueeze(1)
+                    inputs = proj(inputs)  
                 inputs = inputs.view(-1, max_len)
                 targets = targets.view(-1).to(device)
                 length = length.view(-1)
-                inputs = inputs.unsqueeze(-1).to(device)                    
+                inputs = inputs.unsqueeze(-1).to(device)
+                                  
 
                 if USE_TRANSFORMER:
                     batch_size,seq_len,_ = inputs.size()
@@ -270,8 +418,10 @@ def train(model:nn.Module, train_loader:DataLoader, val_loader:DataLoader,max_le
             if early_stop >= EARLY_STOP_EPOCH:
                 print(f'Early stop in epoch {epoch}, because val loss does not change for {EARLY_STOP_EPOCH} epochs')
                 logging.info(f'Early stop in epoch {epoch}, because val loss does not change for {EARLY_STOP_EPOCH} epochs')
+                save_checkpoint(model,optimizer,epoch,loss,best_val_loss,savedir+f'/checkpoint_epoch_{epoch}.pth')
                 break
-        save_checkpoint(model,optimizer,epoch,loss,best_val_loss,savedir+f'/checkpoint_epoch_{epoch}.pth')
+        if (epoch - start_epoch) % 20 == 0:
+            save_checkpoint(model,optimizer,epoch,loss,best_val_loss,savedir+f'/checkpoint_epoch_{epoch}.pth')
 
 def test(model:nn.Module,test_loader:DataLoader,max_len,savedir=None,target_file=None,description='ori test:'):
     optimizer = optim.Adam(model.parameters(), lr=0.0001)
@@ -288,6 +438,11 @@ def test(model:nn.Module,test_loader:DataLoader,max_len,savedir=None,target_file
         format='%(asctime)s - %(levelname)s - %(message)s',
         filemode='a'
     )
+    if ROSETTA:
+        encoder = generate_encoder()
+        proj = nn.Linear(512,max_len).to('cuda')
+        for param in encoder.parameters():
+            param.requires_grad = False
 
     all_targets = []
     all_predictions = []
@@ -297,10 +452,22 @@ def test(model:nn.Module,test_loader:DataLoader,max_len,savedir=None,target_file
     with torch.no_grad():
         for inputs, targets,length in test_loader:
             
+            if ROSETTA:
+                batch_size = inputs.shape[0]
+                seq_len = max_len
+                target_len = 300
+                pad_len = target_len - seq_len
+                if pad_len>0:
+                    inputs = F.pad(inputs,(0,pad_len),'constant',0)
+                inputs = inputs.reshape(-1,3,10,10).to(device)
+                inputs = encoder(inputs).squeeze().unsqueeze(1)
+                inputs = proj(inputs)
             inputs = inputs.view(-1, max_len)
             targets = targets.view(-1).to(device)
             length = length.view(-1)
             inputs = inputs.unsqueeze(-1).to(device)
+               
+                
                 
             if USE_TRANSFORMER:
                 batch_size,seq_len,_ = inputs.size()
@@ -372,9 +539,6 @@ def load_checkpoint(filepath,model,optimizer):
 
 def read_dataframe(input_path):
     df = pd.read_csv(input_path, dtype=flow_column_types)
-    if DROP_DUPLICATE:
-        df = df.groupby('label').apply(lambda x: x.drop_duplicates(subset=['len_sequences'])).reset_index(drop=True)
-        print(len(df))
     
     df['len_sequences'] = df['len_sequences'].apply(lambda x: list(map(int, x.split('_'))))
     
@@ -436,41 +600,48 @@ def create_model(model_name,max_len):
 
 
 if __name__=='__main__':
+    random_seed=42
+    torch.manual_seed(random_seed)
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_path',type=str,
                         default=f'train.csv')
     parser.add_argument('--test_path',type=str,
                         default=f'test.csv')
     parser.add_argument('--model_name',type=str,
-                        default='lstm') #'lstm CNN Transformer DF TMWF_DFNet BAPM'
+                        default='lstm') 
     parser.add_argument('--save_dir',type=str,                        
                         default=f'./info')
-    parser.add_argument('--aug',type=str,default='yes') # 'yes' 'no'
+    parser.add_argument('--aug',type=str,default='noaug')
     parser.add_argument('--should_train',action='store_true')
 
     parser.add_argument('--alpha',type=float,default=1.0)
     parser.add_argument('--preaug_ratio',type=float,default=0.2)
     parser.add_argument('--window',type=int,default=10)
     
-    # size
     parser.add_argument('--valid_size',type=float,default=0.2)
     parser.add_argument('--test_size',type=float,default=0.2)
 
-   
     args = parser.parse_args()
 
     valid_size = args.valid_size
     test_size = args.test_size
 
-    if args.aug == 'yes':
-        print('aug')
-        FREQMIX = True
-        PRE_AUG = True
+    if args.aug in ['ours','freq_mix','mixup']:
+        MIX = True
+        if args.aug == 'ours':
+            PRE_AUG = True
     elif args.aug == 'no':
-        FREQMIX = False
+        MIX = False
         PRE_AUG = False
+    elif args.aug in ['noise','random_mask','reperm']:
+        SINGLE_AUG = True
+    elif args.aug in ['rosetta']:
+        ROSETTA = True
     else:
-        FREQMIX = False
+        MIX = False
         PRE_AUG = False
         print('Unknown arg: aug. Use no augmentation.')
 
@@ -504,7 +675,6 @@ if __name__=='__main__':
 
     
     lr = 0.0001
-    
     model = create_model(model_name=args.model_name,max_len=max_len)
     model = model.to(device)
     if args.model_name == 'Transformer':
@@ -525,7 +695,7 @@ if __name__=='__main__':
     logging.info(f'test_size:{test_size}')
 
     if args.should_train:
-        train(model,train_loader,val_loader,lr=lr,max_len=max_len,savedir=save_dir,alpha=args.alpha,preaug_ratio=args.preaug_ratio,window=args.window)
+        train(model,train_loader,val_loader,lr=lr,max_len=max_len,savedir=save_dir,args=args)
     
     test(model,test_loader,max_len=max_len,target_file=None,savedir=save_dir,description='ID test:')
 

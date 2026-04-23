@@ -1,0 +1,3 @@
+We use the the well-trained TIE via [Link](https://drive.google.com/drive/folders/1WXfdj6egfa593sgGWvoNHfULnWOvKeUY?usp=sharing)  given by the authors in [1].
+
+[1]Renjie Xie, Jiahao Cao, Enhuan Dong, Mingwei Xu, Kun Sun, Qi Li, Licheng Shen, and Menghao Zhang. 2023. Rosetta: Enabling Robust TLS Encrypted Traffic Classification in Diverse Network Environments with TCP-Aware Traffic Augmentation. In 32nd USENIX Security Symposium, USENIX Security 2023, Anaheim, CA, USA, August 9-11, 2023, Joseph A. Calandrino and Carmela Troncoso (Eds.). USENIX Association, 625–642.
