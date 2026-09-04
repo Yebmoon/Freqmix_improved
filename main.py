@@ -614,7 +614,7 @@ if __name__=='__main__':
                         default='lstm') 
     parser.add_argument('--save_dir',type=str,                        
                         default=f'./info')
-    parser.add_argument('--aug',type=str,default='noaug')
+    parser.add_argument('--aug',type=str,default='no')
     parser.add_argument('--should_train',action='store_true')
 
     parser.add_argument('--alpha',type=float,default=1.0)

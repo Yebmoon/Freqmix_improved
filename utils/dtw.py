@@ -1,3 +1,4 @@
+__author__ = 'Brian Iwana'
 
 import numpy as np
 import math
